@@ -16,10 +16,12 @@ Metric: val_revenue_per_kwh (higher is better)
      - departure violation penalties)
   / total kWh transacted, over 365 days of the 2023 val period.
 
-Baseline strategy:
-  - Price forecast: persistence (yesterday's spot prices)
-  - Dispatch: greedy — charge in cheapest 8h, discharge in 4 most expensive
-  - Uses balancing prices to pick the better market (spot vs regulation)
+Exp 2: feasibility-aware dispatch
+  - Before discharging at hour h, verify that remaining plugged hours have
+    sufficient charge capacity to recover back to 0.80 SoC at departure.
+  - Use threshold-based dispatch: only discharge when sell price is in top quartile;
+    only charge when buy price is negative or below median.
+  - Same persistence forecast.
 """
 
 import datetime
@@ -47,6 +49,40 @@ def fit(
     """Store training data; fit any models here."""
     global _train_prices
     _train_prices = train_prices.copy()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _can_discharge(h: int, dep: int, soc: float, cap: float,
+                   max_ch: float, max_ds: float,
+                   schedule_row: np.ndarray,
+                   soc_target: float = 0.80) -> bool:
+    """Return True if discharging max_ds at hour h still allows reaching soc_target by dep.
+
+    After a hypothetical discharge at h, simulate charging in remaining hours
+    using whatever is already scheduled plus max_ch for any uncommitted hour.
+    """
+    eff = 0.92
+    soc_after_ds = soc - max_ds / eff / cap
+    if soc_after_ds < 0.10:
+        return False
+
+    # Remaining hours after h (exclusive of h itself)
+    remaining = list(range(h + 1, dep))
+    soc_proj = soc_after_ds
+    for rh in remaining:
+        scheduled = schedule_row[rh]
+        if scheduled > 0:
+            soc_proj = min(soc_proj + scheduled * eff / cap, 0.95)
+        elif scheduled < 0:
+            soc_proj = max(soc_proj - (-scheduled) / eff / cap, 0.10)
+        else:
+            # Free hour — assume we can charge here if needed
+            soc_proj = min(soc_proj + max_ch * eff / cap, 0.95)
+
+    return soc_proj >= soc_target
 
 
 # ---------------------------------------------------------------------------
@@ -91,15 +127,13 @@ def plan_day(
     else:
         bal_dn_fc = price_forecast * 0.90
 
-    sell_fc = np.maximum(price_forecast, bal_up_fc)   # best price to discharge
-    buy_fc  = np.minimum(price_forecast, bal_dn_fc)   # cheapest price to charge
+    sell_fc = np.maximum(price_forecast, bal_up_fc)
+    buy_fc  = np.minimum(price_forecast, bal_dn_fc)
 
-    # Rank hours for charging (cheapest buy price) and discharging (highest sell price)
-    hour_rank_cheap     = np.argsort(buy_fc)           # cheapest → most expensive
-    hour_rank_expensive = np.argsort(sell_fc)[::-1]    # most expensive first
-
-    cheap_hours     = set(hour_rank_cheap[:8].tolist())      # 8h for charging
-    expensive_hours = set(hour_rank_expensive[:4].tolist())  # 4h for V2G discharge
+    # Threshold-based dispatch: discharge only in top 25% of sell prices;
+    # charge only when buy price is below median.
+    sell_threshold = np.percentile(sell_fc, 75)
+    buy_threshold  = np.median(buy_fc)
 
     schedule = np.zeros((n, 24), dtype=np.float64)
 
@@ -112,20 +146,23 @@ def plan_day(
         max_ds = float(sess["max_discharge_kw"])
 
         plugged = list(range(arr, dep))
-        soc_sim = soc
+        if not plugged:
+            continue
 
+        # First pass: assign cheap-charge and expensive-discharge hours
+        soc_sim = soc
         for h in plugged:
-            if h in expensive_hours and max_ds > 0:
-                # Only discharge if we have headroom above the departure target
-                if soc_sim > 0.85:
+            if sell_fc[h] >= sell_threshold and max_ds > 0:
+                # Check feasibility: can we still reach 0.80 SoC by departure?
+                if _can_discharge(h, dep, soc_sim, cap, max_ch, max_ds, schedule[i]):
                     schedule[i, h] = -max_ds
                     soc_sim = max(soc_sim - max_ds / 0.92 / cap, 0.10)
-            elif h in cheap_hours:
-                if soc_sim < 0.95:
+            elif buy_fc[h] <= buy_threshold:
+                if soc_sim < 0.94:
                     schedule[i, h] = max_ch
                     soc_sim = min(soc_sim + max_ch * 0.92 / cap, 0.95)
 
-        # Safety pass: if projected SoC at departure is below target, charge greedily
+        # Safety pass: ensure departure SoC >= 0.80
         soc_proj = soc
         for h in plugged:
             kw = schedule[i, h]
