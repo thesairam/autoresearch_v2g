@@ -25,6 +25,8 @@ dependencies = [
     "kernels>=0.11.7",
     "rustbpe>=0.1.0",
     "tiktoken>=0.11.0",
+    "ipykernel>=7.2.0",
+    "jupyter-server>=2.18.2",
 ]
 
 [tool.uv.sources]
