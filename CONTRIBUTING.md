@@ -10,19 +10,59 @@ that keep it small, focused, and correct are most welcome.
 | Type | Examples |
 |------|---------|
 | **Better strategies** | Improved `strategy.py` baselines (LP dispatch, ML forecasters, RL policies) |
-| **Better data** | New data sources, additional price zones, real EV session datasets |
-| **Better degradation models** | More accurate battery physics, temperature effects |
-| **New markets** | Adapting `prepare_v2g.py` for other price zones (NO1, SE3, DE, etc.) |
-| **Bug fixes** | Correctness issues in the harness or simulation |
+| **Better data sources** | Real EV session datasets, additional price zones, ENTSO-E integration |
+| **Better degradation models** | More accurate battery physics in the data layer |
+| **New markets / zones** | NO1, SE3, DE-LU, GB — adapting the data pipeline |
+| **Bug fixes** | Correctness issues in simulation physics or constraint handling |
 | **Documentation** | Clearer explanations, better examples |
 | **Analysis notebooks** | Better visualizations, strategy comparison tools |
 
 ## What we do NOT want in PRs
 
-- Changes to `prepare_v2g.py` that modify the **evaluation harness** (`evaluate_v2g`, `simulate_day`) without a very strong reason — this is the fixed ground truth
+- Changes to the **evaluation harness** — `simulate_day()`, `evaluate_v2g()`, physical constraints (SoC bounds, efficiency values, departure penalty structure). This is the fixed ground truth. Changing it makes all prior experiment results incomparable.
 - New dependencies unless clearly justified
 - Complex abstractions — three simple lines beat a premature abstraction
 - Features not used by the core experiment loop
+
+---
+
+## The two halves of `prepare_v2g.py`
+
+`prepare_v2g.py` contains two logically separate things. The rules are different for each:
+
+### Part 1 — Data infrastructure (PRs welcome)
+Functions that **fetch, generate, or transform input data**:
+- `download_spot_prices()` — data source, price zone, date range
+- `download_balancing_prices()` — regulation market data source
+- `generate_sessions()` — EV session distributions and fleet mix
+- `EV_FLEET_TYPES` — vehicle models, battery specs, charge/discharge rates
+- `BATTERY_COST_EUR_PER_KWH`, `BATTERY_LIFETIME_FCE` — battery economics constants
+
+Improving these makes the research signal more realistic. **These PRs are welcome.**
+
+### Part 2 — Evaluation harness (frozen — do not modify)
+Functions and constants that **define what is being measured**:
+- `simulate_day()` — simulation engine, revenue/cost/penalty computation
+- `evaluate_v2g()` — backtest loop, metric aggregation
+- `degradation_eur()`, `_soc_stress()` — degradation physics model
+- `SOC_MIN`, `SOC_MAX`, `SOC_DEPARTURE_MIN` — hard constraints
+- `CHARGE_EFF`, `DISCHARGE_EFF` — efficiency model
+- `TRAIN_START/END`, `VAL_START/END`, `TEST_START/END` — data splits (especially VAL)
+- `HISTORY_DAYS` — context window passed to strategy
+
+Changing any of these shifts the ground truth and makes all prior experiments incomparable. **Do not modify these in PRs.** If you believe a harness constant is wrong, open an issue to discuss first.
+
+### The key rule: data changes require re-baselining
+
+Any PR that changes Part 1 must include the new baseline `val_revenue_per_kwh` in the PR description, produced by running the unmodified `strategy.py` against the new data:
+
+```bash
+uv run prepare_v2g.py --force   # re-download with new data source
+uv run prepare_v2g.py --eval    # run baseline strategy
+# Include the val_revenue_per_kwh output in your PR description
+```
+
+This lets reviewers see what the new data does to the starting point.
 
 ---
 
