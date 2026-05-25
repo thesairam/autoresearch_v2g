@@ -16,13 +16,11 @@ Metric: val_revenue_per_kwh (higher is better)
      - departure violation penalties)
   / total kWh transacted, over 365 days of the 2023 val period.
 
-Exp 4: LP optimal dispatch (cvxpy/CLARABEL) + same-weekday forecast
-  - Maximize (discharge × sell_price − charge × buy_price − degradation_proxy)
-    subject to: SoC evolution, power limits, departure SoC >= 0.80
-  - Each vehicle solved as an independent LP (they're not coupled in harness)
-  - Falls back to greedy on infeasibility or solver failure
-  - Degradation proxy: 0.050 EUR/kWh discharged (conservative vs base 0.040)
-    to penalise unnecessary cycling and keep SoC in healthy range
+Exp 5: LP dispatch + SoC post-processor (fixes numerical violations from Exp 4)
+  - Same LP formulation as Exp 4 (cvxpy/CLARABEL)
+  - After solving, simulate exact SoC trajectory matching the harness model
+  - If SoC at departure < 0.80, override the cheapest remaining hours with charging
+  - Eliminates the rounding-gap violations while preserving LP revenue benefits
 """
 
 import datetime
@@ -45,11 +43,11 @@ _EFF = 0.92
 _SOC_MIN = 0.10
 _SOC_MAX = 0.95
 _SOC_DEP = 0.80
-_DEG_RATE = 0.050  # EUR/kWh discharged — proxy for NMC degradation
+_DEG_RATE = 0.050  # EUR/kWh discharged — NMC degradation proxy
 
 
 # ---------------------------------------------------------------------------
-# fit — called once before the backtest begins
+# fit
 # ---------------------------------------------------------------------------
 
 def fit(
@@ -59,23 +57,21 @@ def fit(
     train_bal_up: np.ndarray | None = None,
     train_bal_dn: np.ndarray | None = None,
 ) -> None:
-    """Store training data; fit any models here."""
     global _train_prices
     _train_prices = train_prices.copy()
 
 
 # ---------------------------------------------------------------------------
-# Price forecast
+# Price forecast — same-weekday weighted rolling mean
 # ---------------------------------------------------------------------------
 
 def _weekday_forecast(price_history: np.ndarray, date: datetime.date) -> np.ndarray:
-    """Weighted mean of same-weekday hours from last 4 occurrences in history."""
     n_days = len(price_history)
     if n_days < 7:
         return price_history[-1].copy() if n_days > 0 else np.full(24, 50.0)
 
     dow = date.weekday()
-    same_dow = []
+    same_dow: list[int] = []
     for offset in range(1, n_days + 1):
         d = date - datetime.timedelta(days=offset)
         if d.weekday() == dow:
@@ -98,38 +94,34 @@ def _weekday_forecast(price_history: np.ndarray, date: datetime.date) -> np.ndar
 def _lp_vehicle(arr: int, dep: int, soc_init: float, cap: float,
                 max_ch: float, max_ds: float,
                 sell_fc: np.ndarray, buy_fc: np.ndarray) -> np.ndarray | None:
-    """Solve the V2G scheduling LP for one vehicle. Returns (24,) kW schedule or None."""
+    """Solve the V2G LP for one vehicle. Returns (24,) kW net schedule or None."""
     if not _CVXPY_OK:
         return None
-    plugged_mask = np.zeros(24, dtype=bool)
-    plugged_mask[arr:dep] = True
+
+    plugged = np.zeros(24, dtype=bool)
+    plugged[arr:dep] = True
 
     charge    = cp.Variable(24, nonneg=True)
     discharge = cp.Variable(24, nonneg=True)
     soc       = cp.Variable(25)
 
-    constraints = [
-        soc[0] == soc_init,
-        soc[dep] >= _SOC_DEP,
-    ]
+    constrs = [soc[0] == soc_init, soc[dep] >= _SOC_DEP]
     for h in range(24):
-        constraints.append(
-            soc[h + 1] == soc[h]
-            + charge[h] * _EFF / cap
-            - discharge[h] / (_EFF * cap)
+        constrs.append(
+            soc[h + 1] == soc[h] + charge[h] * _EFF / cap - discharge[h] / (_EFF * cap)
         )
-        constraints.append(soc[h + 1] >= _SOC_MIN)
-        constraints.append(soc[h + 1] <= _SOC_MAX)
-        if plugged_mask[h]:
-            constraints.append(charge[h] <= max_ch)
-            constraints.append(discharge[h] <= max_ds)
+        constrs.append(soc[h + 1] >= _SOC_MIN)
+        constrs.append(soc[h + 1] <= _SOC_MAX)
+        if plugged[h]:
+            constrs.append(charge[h] <= max_ch)
+            constrs.append(discharge[h] <= max_ds)
         else:
-            constraints.append(charge[h] == 0.0)
-            constraints.append(discharge[h] == 0.0)
+            constrs.append(charge[h] == 0.0)
+            constrs.append(discharge[h] == 0.0)
 
-    revenue = cp.sum(cp.multiply(sell_fc, discharge) - cp.multiply(buy_fc, charge))
+    revenue    = cp.sum(cp.multiply(sell_fc, discharge) - cp.multiply(buy_fc, charge))
     degradation = _DEG_RATE * cp.sum(discharge)
-    prob = cp.Problem(cp.Maximize(revenue - degradation), constraints)
+    prob = cp.Problem(cp.Maximize(revenue - degradation), constrs)
 
     try:
         prob.solve(solver=cp.CLARABEL, warm_start=True)
@@ -137,26 +129,62 @@ def _lp_vehicle(arr: int, dep: int, soc_init: float, cap: float,
         return None
 
     if prob.status not in ("optimal", "optimal_inaccurate"):
-        # Infeasible (physically can't reach 80% SoC) — relax departure constraint and retry
-        constraints_relaxed = [c for c in constraints if c is not constraints[1]]
-        prob2 = cp.Problem(cp.Maximize(revenue - degradation), constraints_relaxed)
+        # Departure constraint infeasible — relax it and just maximize revenue
+        constrs_relaxed = constrs[:1] + constrs[2:]  # remove soc[dep] >= _SOC_DEP
+        prob2 = cp.Problem(cp.Maximize(revenue - degradation), constrs_relaxed)
         try:
             prob2.solve(solver=cp.CLARABEL)
         except Exception:
             return None
         if prob2.status not in ("optimal", "optimal_inaccurate"):
             return None
-        ch = charge.value
-        ds = discharge.value
-    else:
-        ch = charge.value
-        ds = discharge.value
 
+    ch = charge.value
+    ds = discharge.value
     if ch is None or ds is None:
         return None
 
-    schedule = np.clip(ch, 0, max_ch) - np.clip(ds, 0, max_ds)
-    return schedule
+    return np.clip(ch, 0.0, max_ch) - np.clip(ds, 0.0, max_ds)
+
+
+# ---------------------------------------------------------------------------
+# Post-processor — guarantee departure SoC >= 0.80
+# ---------------------------------------------------------------------------
+
+def _ensure_departure_soc(schedule_row: np.ndarray, arr: int, dep: int,
+                           soc_init: float, cap: float, max_ch: float,
+                           buy_fc: np.ndarray) -> np.ndarray:
+    """Simulate SoC exactly and patch any departure shortfall with cheap charging."""
+    plugged = list(range(arr, dep))
+    soc = soc_init
+    for h in plugged:
+        kw = schedule_row[h]
+        if kw > 0:
+            soc = min(soc + kw * _EFF / cap, _SOC_MAX)
+        elif kw < 0:
+            soc = max(soc + kw / (_EFF * cap), _SOC_MIN)
+
+    if soc >= _SOC_DEP - 1e-6:
+        return schedule_row
+
+    out = schedule_row.copy()
+    # Add charging in the cheapest remaining hours until departure SoC is met
+    for h in sorted(plugged, key=lambda h: buy_fc[h]):
+        if soc >= _SOC_DEP:
+            break
+        current = out[h]
+        if current < max_ch:
+            added = max_ch - current
+            if current < 0:
+                # Was discharging — flip to charging
+                soc -= current / (_EFF * cap)   # undo discharge
+                soc = min(soc + max_ch * _EFF / cap, _SOC_MAX)
+                out[h] = max_ch
+            else:
+                soc = min(soc + added * _EFF / cap, _SOC_MAX)
+                out[h] = max_ch
+
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +194,6 @@ def _lp_vehicle(arr: int, dep: int, soc_init: float, cap: float,
 def _greedy_vehicle(arr: int, dep: int, soc_init: float, cap: float,
                     max_ch: float, max_ds: float,
                     sell_fc: np.ndarray, buy_fc: np.ndarray) -> np.ndarray:
-    """Simple greedy: charge cheapest hours to 80% SoC, discharge top-priced hours."""
     schedule = np.zeros(24)
     plugged = list(range(arr, dep))
     if not plugged:
@@ -197,7 +224,7 @@ def _greedy_vehicle(arr: int, dep: int, soc_init: float, cap: float,
 
 
 # ---------------------------------------------------------------------------
-# plan_day — called once per evaluation day
+# plan_day
 # ---------------------------------------------------------------------------
 
 def plan_day(
@@ -244,9 +271,10 @@ def plan_day(
         max_ds = float(sess["max_discharge_kw"])
 
         result = _lp_vehicle(arr, dep, soc, cap, max_ch, max_ds, sell_fc, buy_fc)
-        if result is not None:
-            schedule[i] = result
-        else:
-            schedule[i] = _greedy_vehicle(arr, dep, soc, cap, max_ch, max_ds, sell_fc, buy_fc)
+        if result is None:
+            result = _greedy_vehicle(arr, dep, soc, cap, max_ch, max_ds, sell_fc, buy_fc)
+
+        # Post-process: fix any departure SoC gap from numerical tolerance
+        schedule[i] = _ensure_departure_soc(result, arr, dep, soc, cap, max_ch, buy_fc)
 
     return schedule
