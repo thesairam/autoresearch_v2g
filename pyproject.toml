@@ -1,21 +1,30 @@
 [project]
-name = "autoresearch"
+name = "autoresearch-v2g"
 version = "0.1.0"
-description = "Autonomous pretraining research swarm"
+description = "Autonomous AI research for V2G fleet optimization"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "kernels>=0.11.7",
-    "matplotlib>=3.10.8",
+    # Core numerics & data
     "numpy>=2.2.6",
     "pandas>=2.3.0",
-    "pyarrow>=21.0.0",
-    "requests>=2.32.0",
-    "rustbpe>=0.1.0",
-    "scikit-learn>=1.5.0",
     "scipy>=1.13.0",
-    "tiktoken>=0.11.0",
+    "scikit-learn>=1.5.0",
+    # Optimization — LP/QP dispatch (standard in V2G literature, used by FlexMeasures)
+    "cvxpy>=1.5.0",
+    # Deep learning — for ML-based forecasting and RL policies
     "torch==2.9.1",
+    "stable-baselines3>=2.3.0",      # PPO/SAC/TD3; used by EV2Gym
+    # Energy market data
+    "requests>=2.32.0",
+    "entsoe-py>=0.6.0",              # ENTSO-E Transparency Platform (optional, needs token)
+    # Visualization & analysis
+    "matplotlib>=3.10.8",
+    "pyarrow>=21.0.0",
+    # Original autoresearch LM deps (kept for continuity)
+    "kernels>=0.11.7",
+    "rustbpe>=0.1.0",
+    "tiktoken>=0.11.0",
 ]
 
 [tool.uv.sources]

@@ -8,112 +8,94 @@ and keeping only improvements — indefinitely, without human intervention.
 
 ## Setup
 
-To start a new experiment run, work with the user to:
+Work with the user to:
 
 1. **Agree on a run tag**: propose a tag based on today's date (e.g. `may25`). The branch `autoresearch/<tag>` must not already exist.
 2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
-3. **Read the in-scope files** — the entire repo is small; read all of them:
-   - `README.md` — repository context.
-   - `prepare_v2g.py` — **fixed and immutable**. Contains fleet constants, data pipeline, simulation engine, and the `evaluate_v2g()` evaluation harness. **Never modify this file.**
-   - `strategy.py` — the **only** file you modify. Implements price forecasting and dispatch scheduling.
+3. **Read all in-scope files**:
+   - `README.md` — project context, data sources, metric definition.
+   - `prepare_v2g.py` — **fixed and immutable**. Fleet constants, data pipeline, battery degradation model, simulation engine, `evaluate_v2g()`. Never modify this file.
+   - `strategy.py` — the **only** file you modify.
    - `program_v2g.md` — this file. All rules live here.
-4. **Verify data is cached**: Check that `~/.cache/autoresearch_v2g/` exists and contains `prices_eur_mwh.npy`, `sessions.json`, `dates.json`. If not, tell the human to run: `uv run prepare_v2g.py`
-5. **Initialize results_v2g.tsv**: Create it with just the header row (see Logging section). The baseline will be recorded after the first run.
-6. **Confirm and go**: Confirm setup looks good, then kick off the experimentation loop.
+4. **Verify data is cached**: Check that `~/.cache/autoresearch_v2g/` exists with `prices_eur_mwh.npy`, `sessions.json`, `dates.json`. If not: `uv run prepare_v2g.py`
+5. **Initialize results_v2g.tsv**: Create with just the header row (see Logging).
+6. **Confirm and go**.
 
 ---
 
 ## The Problem
 
-A fleet of **30 EVs** at a workplace depot (15 with V2G discharge capability) must be
-scheduled for charging and discharging across 24 hours each day.
+A fleet of **30 EVs** at a European workplace depot must be scheduled for charging
+and V2G discharging across each 24-hour day.
 
-The strategy receives:
-- Hourly electricity spot prices for the past 30 days (from Nord Pool DK1)
-- Historical vehicle session data for the past 30 days
-- Today's vehicle sessions: arrival/departure times, initial SoC, battery specs
+**Fleet mix** (2024-era models, fixed in harness):
+- Hyundai IONIQ 5 (V2G, 77.4 kWh, 3.6 kW discharge)
+- Nissan Leaf e+ (V2G via CHAdeMO, 62 kWh, 3.3 kW discharge)
+- Renault Megane E-Tech (V2G, 60 kWh, 3.7 kW discharge)
+- VW ID.4, Tesla Model 3 LR, Renault Zoe (charge-only)
 
-The strategy must return a charge/discharge schedule (kW per vehicle per hour) for
-the full upcoming 24 hours. The schedule is then simulated against **actual** prices.
+**Data available to strategy** (passed by harness on each day):
+- Spot price history: Nord Pool DK1 day-ahead prices EUR/MWh (30-day window)
+- Balancing market history: up/down regulation prices EUR/MWh (30-day window)
+- Session history: which vehicles arrived/departed and when (30 days)
+- Today's vehicle states: arrival hour, departure hour, SoC on arrival, battery specs
 
-**What the agent optimizes:**
-
-```
-val_revenue_per_kwh = (V2G_revenue - charging_cost - degradation_penalty) / kWh_transacted
-```
-
-This is computed by the **fixed harness** (`evaluate_v2g()` in `prepare_v2g.py`) over the
-pinned validation period (full year 2023, 365 days). Higher is better.
-
-**Hard constraints** (enforced by the harness — you cannot relax these):
-- SoC must stay within [10%, 95%] at all times
-- Each vehicle must reach ≥80% SoC before departure (3× price penalty if violated)
-- Max charge rate: 11 kW per vehicle (AC Type 2)
-- Max discharge rate: 7.4 kW per V2G vehicle
-- Total site grid limit: 300 kW
-
-**Degradation** (fixed model — you cannot change this):
-- Each kWh discharged via V2G costs 0.050 EUR (battery wear)
+**What the strategy must return**: A 24-hour charge/discharge schedule (kW per vehicle).
 
 ---
 
-## Experimentation
+## Metric
 
-**What you CAN do:**
-- Modify `strategy.py` — this is the **only** file you edit. Everything in it is fair game:
-  - Price forecasting model (any architecture: LSTM, Transformer, XGBoost, statistical, etc.)
-  - Availability/session forecasting
-  - Dispatch optimization method (rule-based, LP, MPC, RL, heuristic, etc.)
-  - Feature engineering from price history and session history
-  - How you handle uncertainty, SoC constraints, departure deadlines
-  - Internal module state, helper functions, global variables
+```
+val_revenue_per_kwh = (V2G_revenue + arbitrage_savings − degradation) / kWh_transacted
+```
 
-**What you CANNOT do:**
-- **Never modify `prepare_v2g.py`**. It is permanently read-only. It contains the fixed
-  fleet constants, simulation engine, and evaluation harness. Modifying it invalidates
-  all comparisons and breaks the experiment.
-- **Never modify the evaluation harness**. The `evaluate_v2g()` and `simulate_day()`
-  functions in `prepare_v2g.py` are the ground truth. You cannot change degradation
-  rates, constraint penalties, SoC bounds, or any other harness parameter.
-- **Do not install new packages** or modify `pyproject.toml`. Use only what is already
-  available: `numpy`, `requests`, `torch`, `pandas`, `matplotlib`, and stdlib.
-- Do not modify `program_v2g.md`, `README.md`, or any file other than `strategy.py`.
+Computed by the **fixed harness** over the pinned 2023 validation period (365 days).
+Higher is better. Baseline: ~−0.076 EUR/kWh. A good strategy reaches positive values.
 
-**The goal is simple: maximize `val_revenue_per_kwh`.** Everything in `strategy.py` is
-yours to change. Better price forecasting leads to better dispatch timing. Better dispatch
-optimization extracts more value from the same forecasts. Both directions matter.
+**Revenue model** (in `simulate_day`, harness):
+- **Discharging**: paid at `max(spot_price, balancing_up_price)` per kWh exported
+- **Charging**: costs `min(spot_price, balancing_down_price)` per kWh consumed
+- **Degradation**: SoC-stress-weighted per kWh discharged (NMC model, fixed in harness)
+  - Base rate ~0.040 EUR/kWh at 50% SoC sweet spot
+  - Rises to ~0.092 EUR/kWh at 95% SoC (high-SoC lithium plating penalty)
+  - Incentive: keep SoC in 20–80% range to minimize degradation
+- **Departure violation**: 3× peak-price penalty per kWh short of 80% SoC at departure
 
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement
-from 20 extra lines of complex code is not worth it. A simplification that maintains
-equal or better performance is always a win. When deciding whether to keep a change,
-weigh complexity cost against improvement magnitude.
+---
 
-**The first run**: Your very first run must be with the unmodified baseline `strategy.py`
-to establish the baseline `val_revenue_per_kwh`.
+## Rules
+
+**You CAN modify** `strategy.py` — everything in it is fair game:
+- Price and availability forecasting models (any architecture)
+- Feature engineering from the history windows
+- Dispatch optimization method (rule-based, LP, MPC, RL, anything)
+- Internal state, helper functions, global variables, imports
+
+**You CANNOT**:
+- **Never modify `prepare_v2g.py`** — permanently read-only. It is the fixed evaluation ground truth. Modifying it invalidates all experiment comparisons.
+- **Never modify `program_v2g.md`**, `README.md`, or any file other than `strategy.py`.
+- **Do not modify the degradation model** in `prepare_v2g.py`. It is the fixed battery cost model.
+- **Do not install new packages** beyond what is in `pyproject.toml`. All major tools are already available: `numpy`, `scipy`, `cvxpy`, `torch`, `stable-baselines3`, `scikit-learn`, `pandas`.
+
+**Simplicity criterion**: A small improvement from adding 30 lines of complex code is not worth it. A simplification that maintains equal or better performance is always a win.
+
+**First run**: Run the unmodified baseline to establish `val_revenue_per_kwh`.
 
 ---
 
 ## Running an Experiment
 
 ```bash
-uv run prepare_v2g.py --eval > run.log 2>&1
+uv run prepare_v2g.py --eval > run.log 2>&1      # full val backtest (~2-4 min)
+uv run prepare_v2g.py --smoke > run.log 2>&1     # 7-day smoke test (fast, for debugging)
 ```
 
-This runs the full backtest on the **val period (2023, 365 days)** and prints structured
-output. The run takes approximately 2–4 minutes depending on strategy complexity.
-
-For a quick smoke test during development (7 days only):
-```bash
-uv run prepare_v2g.py --smoke > run.log 2>&1
-```
-
-**Timeout**: If a run exceeds **10 minutes**, kill it and treat it as a crash.
+**Timeout**: Kill any run exceeding **10 minutes**. Treat as crash.
 
 ---
 
 ## Output Format
-
-When the backtest finishes, `prepare_v2g.py` prints:
 
 ```
 ---
@@ -124,101 +106,201 @@ total_discharged_kwh:          18320.4
 total_constraint_violations:   12
 num_eval_days:                 365
 total_seconds:                 142.3
-forecast_rmse_eur_mwh:         8.42        ← only shown if strategy exposes last_price_forecast
+forecast_rmse_eur_mwh:         8.42        ← only shown if last_price_forecast is set
 ```
 
-Extract the primary metric from the log:
-
-```bash
-grep "^val_revenue_per_kwh:" run.log
-```
+Parse: `grep "^val_revenue_per_kwh:" run.log`
 
 ---
 
 ## Logging Results
 
-Record each experiment in `results_v2g.tsv` (tab-separated, NOT comma-separated).
-Do **not** commit this file — leave it untracked by git.
-
-Header and columns:
+`results_v2g.tsv` — tab-separated, **not** git-tracked.
 
 ```
 commit	val_revenue_per_kwh	violations	status	description
 ```
 
-1. git commit hash (short, 7 chars)
-2. `val_revenue_per_kwh` (e.g. `0.023841`) — use `0.000000` for crashes
-3. `total_constraint_violations` count — use `0` for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short description of what this experiment tried
-
-Example:
-
-```
-commit	val_revenue_per_kwh	violations	status	description
-a1b2c3d	0.023841	12	keep	baseline: persistence forecast + greedy dispatch
-b2c3d4e	0.027312	8	keep	LP dispatch with scipy.optimize.linprog
-c3d4e5f	0.019500	45	discard	RL policy (SAC) — high violations, needs more tuning
-d4e5f6g	0.000000	0	crash	LSTM price model — missing torch.nn import
-```
+- `status`: `keep`, `discard`, or `crash`
+- Use `0.000000` and `0` for crashes
 
 ---
 
 ## The Experiment Loop
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/may25`).
-
 **LOOP FOREVER:**
 
-1. Check git state: current branch and commit.
-2. Edit `strategy.py` with an experimental idea.
+1. Check git state (branch and current commit).
+2. Edit `strategy.py`.
 3. `git commit`
-4. Run the backtest: `uv run prepare_v2g.py --eval > run.log 2>&1`
-5. Extract results: `grep "^val_revenue_per_kwh:\|^total_constraint_violations:" run.log`
-6. If grep output is empty → the run crashed. Run `tail -n 50 run.log` to see the traceback. Attempt a fix if it's trivial. If the idea is fundamentally broken, skip it.
-7. Record results in `results_v2g.tsv`.
-8. If `val_revenue_per_kwh` improved (**higher**), advance the branch (keep the commit).
-9. If equal or worse, `git reset --hard HEAD~1` to discard the change.
-
----
-
-## Crash Handling
-
-- **Simple crash** (typo, missing variable, import error): fix it, re-run on the same commit.
-- **Fundamentally broken idea** (e.g. LP infeasible by design, OOM, infinite loop): log as `crash`, reset, move on.
-- **Constraint explosion** (violations >> baseline): the strategy is probably not honoring departure SoC requirements. Fix the safety pass in dispatch or discard.
+4. `uv run prepare_v2g.py --eval > run.log 2>&1`
+5. `grep "^val_revenue_per_kwh:\|^total_constraint_violations:" run.log`
+6. Empty output → crash. Check `tail -n 50 run.log`. Fix if trivial, skip if not.
+7. Log to `results_v2g.tsv`.
+8. If `val_revenue_per_kwh` improved (**higher**): keep the commit.
+9. If same or worse: `git reset --hard HEAD~1`.
 
 ---
 
 ## Research Directions
 
-Ideas the agent should explore (not exhaustive):
+Draw on the following established approaches. These are not exhaustive — be creative.
 
-**Forecasting improvements:**
-- Replace persistence with rolling mean, ETS, or ARIMA for price forecasting
-- Add calendar features (hour-of-day, day-of-week, month) for price patterns
-- Use a Transformer or LSTM trained on price sequences
-- Probabilistic forecasting (predict price quantiles, plan conservatively)
-- Cluster historical days by price profile, use nearest-neighbor forecast
+### Tier 1: High-impact, proven approaches
 
-**Dispatch improvements:**
-- Replace greedy rules with Linear Programming (`scipy.optimize.linprog` or `cvxpy`)
-- Model Predictive Control: solve LP at each hour with rolling forecast
-- Multi-vehicle coordination (minimize peak grid demand while maximizing revenue)
-- Risk-aware dispatch: if forecast uncertainty is high, charge conservatively first
-- Separate fast-charge pass (meet SoC target) from V2G pass (maximize revenue)
+**LP/QP dispatch (gold standard in V2G literature)**
 
-**Combined improvements:**
-- Train a simple neural price forecaster + LP dispatch
-- Predict session arrival/departure distributions and use in dispatch planning
-- Per-vehicle personalization based on historical session patterns
+The optimal dispatch given a price forecast is a convex optimization problem.
+Use `cvxpy` to formulate it exactly:
+
+```python
+import cvxpy as cp
+
+def lp_dispatch(vehicle_states, price_forecast, bal_up_forecast, bal_dn_forecast):
+    """Solve the day-ahead V2G scheduling LP for all vehicles.
+
+    For each vehicle i, hour h:
+      charge[i,h] >= 0, discharge[i,h] >= 0
+      soc[i,h+1] = soc[i,h] + charge[i,h]*eff/cap - discharge[i,h]/(eff*cap)
+      soc ∈ [SOC_MIN, SOC_MAX]
+      soc[dep] >= 0.80 (departure constraint)
+
+    Objective: maximize Σ_h (discharge[i,h]*sell_price[h] - charge[i,h]*buy_price[h])
+               minus degradation proxy
+    """
+    ...
+```
+
+Reference: Sortomme & El-Sharkawi (2012), "Optimal Charging Strategies for Unidirectional
+Vehicle-to-Grid." IEEE Trans. Smart Grid.
+
+**Model Predictive Control (MPC)**
+
+Re-solve the LP at each hour using updated price forecasts, rolling forward:
+- Hour 0: plan 24h, execute hour 0
+- Hour 1: replan remaining 23h with any new information, execute hour 1
+- More robust to forecast errors than plan-once dispatch
+
+Reference: Halvgaard et al. (2012), "Electric Vehicle Charge Planning using Economic MPC."
+
+**Price forecasting → better dispatch**
+
+Any improvement in price forecasting directly improves dispatch decisions.
+The current baseline (persistence, RMSE ~36 EUR/MWh) leaves a lot on the table.
+
+Approaches (from best in practice):
+- **SARIMA / ETS**: 15–25 EUR/MWh RMSE on DK1 day-ahead
+- **Gradient Boosting (XGBoost/LightGBM)**: 10–18 EUR/MWh RMSE; use features:
+  hour-of-day, day-of-week, month, lagged prices (t-24h, t-48h, t-168h)
+- **Transformer / LSTM**: 8–15 EUR/MWh RMSE with sufficient training data
+- **Day-type clustering**: cluster past days by price profile shape, use nearest-neighbor
+
+Reference: Hong & Fan (2016), "Probabilistic Electric Load Forecasting." Int'l Journal of Forecasting.
+
+### Tier 2: Moderate complexity, worth trying
+
+**Reinforcement Learning (EV2Gym approach)**
+
+EV2Gym (StavrosOrf/EV2Gym, NeurIPS 2024) frames V2G as an RL problem:
+- State: current SoC per vehicle, hour of day, price history, remaining session time
+- Action: charge/discharge power per vehicle (continuous)
+- Reward: revenue − degradation − violation penalty
+- Algorithm: SAC or PPO (both in `stable-baselines3`)
+
+To implement: wrap the backtest loop as a gym environment, train offline on
+train-set days, evaluate on val-set days. The harness's `simulate_day()` can
+be reused as the step function.
+
+Reference: Orfanoudakis et al. (2024), "EV2Gym: A Flexible V2G Simulator for EV Smart Charging."
+
+**Uncertainty-aware scheduling (FlexMeasures approach)**
+
+FlexMeasures (SeitaBV/flexmeasures) uses probabilistic forecasts to build
+robust schedules:
+- Produce a distribution of price forecasts (quantiles or samples)
+- Solve a robust or stochastic LP: guarantee departure SoC even in worst-case scenario
+- Accept lower expected revenue in exchange for fewer violations
+
+This is valuable when the penalty for violations is high (it is — 3× peak price).
+
+**Battery-aware dispatch**
+
+The harness penalizes high-SoC operation via the SoC stress factor in `degradation_eur()`.
+Exploit this explicitly:
+- Reserve high-SoC capacity for rare very-high-price events only
+- Use shallow cycles (20–60% SoC range) for routine arbitrage
+- Track cumulative degradation per vehicle and throttle V2G for high-mileage units
+
+Reference: Schmalstieg et al. (2014), "A Holistic Aging Model for Li(NiMnCo)O2."
+Journal of Power Sources.
+
+### Tier 3: Advanced combinations
+
+**Joint forecast + dispatch training (end-to-end)**
+
+Train a differentiable LP layer (cvxpylayers) where the upstream forecasting
+network and downstream dispatch optimizer are trained jointly to minimize regret,
+not just forecast error. This directly optimizes the business metric.
+
+Reference: Elmachtoub & Grigas (2022), "Smart Predict, then Optimize." Management Science.
+
+**Multi-market participation**
+
+The harness passes both spot and balancing market prices. A sophisticated strategy
+can decide, per hour, whether to participate in the spot market or the regulation
+market (whichever pays more):
+- Discharge hours where `bal_up > spot`: participate in up-regulation
+- Charge hours where `bal_dn < spot`: participate in down-regulation
+- Track capacity commitments (you can't offer more than physically available)
+
+**Session arrival forecasting**
+
+The harness reveals session data at the start of the day (simplified day-ahead
+assumption). But you can also model session uncertainty:
+- Predict arrival probability per vehicle using historical patterns
+- Use robust dispatch that handles both "vehicle arrives" and "vehicle doesn't arrive"
+- This reduces violations on days with unexpected low attendance
+
+---
+
+## Key References
+
+Papers the agent should consider when proposing experiments:
+
+1. **Kempton & Tomić (2005)** — "Vehicle-to-grid power fundamentals." J. Power Sources.
+   *The foundational V2G paper. Read if you haven't — defines the core economics.*
+
+2. **Yilmaz & Krein (2013)** — "Review of Battery Charger Topologies, Charging Power Levels,
+   and Infrastructure for Plug-In Electric and Hybrid Vehicles." IEEE Trans. Power Electronics.
+   *Technical specs for charge/discharge rates used in fleet models.*
+
+3. **Sortomme & El-Sharkawi (2012)** — "Optimal Scheduling of Vehicle-to-Grid Energy and
+   Ancillary Services." IEEE Trans. Smart Grid.
+   *LP formulation of V2G dispatch — the template for cvxpy-based strategies.*
+
+4. **Schmalstieg et al. (2014)** — "A Holistic Aging Model for Li(NiMnCo)O2."
+   Journal of Power Sources. *The SoC-stress degradation model used in this harness.*
+
+5. **Orfanoudakis et al. (2024)** — "EV2Gym: A Flexible V2G Simulator."
+   *Reference RL environment; architecture applicable to this problem.*
+
+---
+
+## Open Source Reference Implementations
+
+| Project | What to borrow |
+|---------|---------------|
+| [EV2Gym](https://github.com/StavrosOrf/EV2Gym) | RL environment structure, SAC/PPO dispatch, EV specs |
+| [FlexMeasures](https://github.com/FlexMeasures/flexmeasures) | Probabilistic forecasting, robust LP scheduling, ENTSO-E integration |
+| [PyBaMM](https://github.com/pybamm-team/PyBaMM) | Electrochemical battery degradation (detailed physics, heavy) |
+| [CVXPY examples](https://www.cvxpy.org/examples/index.html) | LP/QP dispatch formulations |
+| [Stable-Baselines3](https://github.com/DLR-RM/stable-baselines3) | SAC, PPO, TD3 implementations for RL dispatch |
 
 ---
 
 ## NEVER STOP
 
-Once the loop begins, **do NOT pause to ask the human if you should continue**. Do not
-ask "should I keep going?" or "is this a good stopping point?". The human may be asleep
-or away from the computer and expects indefinite autonomous operation. You are a
-researcher. If you run out of ideas, think harder — revisit near-misses, combine
-approaches, try more radical changes. The loop runs until the human interrupts you.
+Once the loop begins, **do NOT pause to ask the human if you should continue**.
+You are autonomous. If you run out of ideas: re-read the papers above, revisit
+near-misses, try combining approaches, try more radical changes. The loop runs
+until the human interrupts you.

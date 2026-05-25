@@ -19,5 +19,12 @@ AGENTS.md
 # Experimental code/artifacts
 dev/
 
-# Results file
+# Results files (untracked — written during agent runs)
 results.tsv
+results_v2g.tsv
+
+# Generated visualizations
+prices_overview.png
+fleet_patterns.png
+strategy_deepdive.png
+progress.png

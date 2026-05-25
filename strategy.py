@@ -1,44 +1,50 @@
 """
 V2G fleet scheduling strategy — the ONLY file the agent may modify.
 
-Implements two required functions:
-    fit(train_prices, train_sessions)  -> None
-    plan_day(date, price_history, session_history, vehicle_states) -> np.ndarray
+Required functions:
+    fit(train_prices, train_sessions, *, train_bal_up, train_bal_dn) -> None
+    plan_day(date, price_history, session_history, vehicle_states,
+             *, bal_up_history, bal_dn_history) -> np.ndarray
 
-Optionally expose:
-    last_price_forecast: np.ndarray | None  # shape (24,), logged as diagnostic
+Optional attribute:
+    last_price_forecast: np.ndarray | None  # shape (24,) — logged as diagnostic
 
-Metric optimized by the harness:
-    val_revenue_per_kwh  (higher is better)
-    = (gross V2G revenue - battery degradation cost) / total kWh transacted
-    evaluated on fixed val period (2023), 30-vehicle workplace fleet.
+Metric: val_revenue_per_kwh (higher is better)
+  = (V2G revenue via up-regulation + energy arbitrage
+     - charging cost via down-regulation
+     - SoC-stress-weighted battery degradation
+     - departure violation penalties)
+  / total kWh transacted, over 365 days of the 2023 val period.
 
-Current baseline strategy:
-  - Price forecast: persistence (yesterday's prices = tomorrow's prices)
-  - Dispatch: greedy rule — charge in cheapest 8h, discharge in most expensive 4h
-               subject to SoC and charger constraints
+Baseline strategy:
+  - Price forecast: persistence (yesterday's spot prices)
+  - Dispatch: greedy — charge in cheapest 8h, discharge in 4 most expensive
+  - Uses balancing prices to pick the better market (spot vs regulation)
 """
 
 import datetime
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# Module-level state (survives across plan_day calls within one backtest)
+# Module state
 # ---------------------------------------------------------------------------
 
-_train_prices: np.ndarray | None = None  # shape (N_train, 24)
-last_price_forecast: np.ndarray | None = None  # exposed for diagnostic logging
+_train_prices: np.ndarray | None = None
+last_price_forecast: np.ndarray | None = None
 
 
 # ---------------------------------------------------------------------------
-# fit — called once before backtest begins
+# fit — called once before the backtest begins
 # ---------------------------------------------------------------------------
 
 def fit(
-    train_prices: np.ndarray,       # shape (N_train_days, 24), EUR/MWh
-    train_sessions: list,           # N_train_days × list[dict]
+    train_prices: np.ndarray,
+    train_sessions: list,
+    *,
+    train_bal_up: np.ndarray | None = None,
+    train_bal_dn: np.ndarray | None = None,
 ) -> None:
-    """Fit any models on training data. Store state in module globals."""
+    """Store training data; fit any models here."""
     global _train_prices
     _train_prices = train_prices.copy()
 
@@ -49,82 +55,91 @@ def fit(
 
 def plan_day(
     date: datetime.date,
-    price_history: np.ndarray,      # shape (H, 24), H ≤ 30 days of history
-    session_history: list,          # H days of past sessions
-    vehicle_states: list,           # today's vehicles (dicts with arrival/departure/SoC etc.)
+    price_history: np.ndarray,     # (H, 24) spot prices EUR/MWh
+    session_history: list,
+    vehicle_states: list,
+    *,
+    bal_up_history: np.ndarray | None = None,  # (H, 24) up-regulation prices
+    bal_dn_history: np.ndarray | None = None,  # (H, 24) down-regulation prices
 ) -> np.ndarray:
-    """Produce 24h charge/discharge schedule for all vehicles.
+    """Return a (N_vehicles, 24) schedule in kW.
 
-    Returns np.ndarray of shape (N_vehicles, 24):
-        Positive values = charging (kW)
-        Negative values = discharging / V2G export (kW, only for V2G-capable vehicles)
+    Positive = charging from grid.
+    Negative = discharging to grid (V2G — only for vehicles with max_discharge_kw > 0).
     """
     global last_price_forecast
 
-    n_vehicles = len(vehicle_states)
-    if n_vehicles == 0:
+    n = len(vehicle_states)
+    if n == 0:
         last_price_forecast = None
         return np.zeros((0, 24))
 
-    # --- Price forecast: persistence (yesterday's prices) ---
-    if len(price_history) > 0:
-        price_forecast = price_history[-1].copy().astype(np.float64)
-    else:
-        price_forecast = np.full(24, 50.0)  # fallback: 50 EUR/MWh flat
-
+    # --- Persistence price forecast: yesterday's spot ---
+    price_forecast = price_history[-1].copy().astype(np.float64) if len(price_history) > 0 \
+                     else np.full(24, 50.0)
     last_price_forecast = price_forecast
 
-    # --- Greedy dispatch ---
-    schedule = np.zeros((n_vehicles, 24), dtype=np.float64)
+    # Effective sell price per hour: max of spot and up-regulation forecast
+    if bal_up_history is not None and len(bal_up_history) > 0:
+        bal_up_fc = bal_up_history[-1].astype(np.float64)
+    else:
+        bal_up_fc = price_forecast * 1.10
 
-    # Rank hours by predicted price
-    hour_rank = np.argsort(price_forecast)          # cheapest → most expensive
-    cheap_hours = set(hour_rank[:8].tolist())       # 8 cheapest hours: charge
-    expensive_hours = set(hour_rank[-4:].tolist())  # 4 most expensive hours: discharge
+    # Effective buy price per hour: min of spot and down-regulation forecast
+    if bal_dn_history is not None and len(bal_dn_history) > 0:
+        bal_dn_fc = bal_dn_history[-1].astype(np.float64)
+    else:
+        bal_dn_fc = price_forecast * 0.90
+
+    sell_fc = np.maximum(price_forecast, bal_up_fc)   # best price to discharge
+    buy_fc  = np.minimum(price_forecast, bal_dn_fc)   # cheapest price to charge
+
+    # Rank hours for charging (cheapest buy price) and discharging (highest sell price)
+    hour_rank_cheap     = np.argsort(buy_fc)           # cheapest → most expensive
+    hour_rank_expensive = np.argsort(sell_fc)[::-1]    # most expensive first
+
+    cheap_hours     = set(hour_rank_cheap[:8].tolist())      # 8h for charging
+    expensive_hours = set(hour_rank_expensive[:4].tolist())  # 4h for V2G discharge
+
+    schedule = np.zeros((n, 24), dtype=np.float64)
 
     for i, sess in enumerate(vehicle_states):
-        arr      = sess["arrival_hour"]
-        dep      = sess["departure_hour"]
-        soc      = sess["soc_arrival"]
-        cap      = sess["battery_capacity_kwh"]
-        max_ch   = sess["max_charge_kw"]
-        max_dis  = sess["max_discharge_kw"]
-        soc_tgt  = 0.80  # must reach before departure
+        arr    = int(sess["arrival_hour"])
+        dep    = int(sess["departure_hour"])
+        soc    = float(sess["soc_arrival"])
+        cap    = float(sess["battery_capacity_kwh"])
+        max_ch = float(sess["max_charge_kw"])
+        max_ds = float(sess["max_discharge_kw"])
 
-        # Simulate SoC forward to decide how aggressively to charge/discharge
+        plugged = list(range(arr, dep))
         soc_sim = soc
-        plugged_hours = list(range(arr, dep))
 
-        for h in plugged_hours:
-            if h in expensive_hours and max_dis > 0:
-                # Discharge only if we have buffer above minimum safe SoC
-                if soc_sim > soc_tgt + 0.05:
-                    schedule[i, h] = -max_dis
-                    energy_out = max_dis / 0.92
-                    soc_sim = max(soc_sim - energy_out / cap, 0.10)
+        for h in plugged:
+            if h in expensive_hours and max_ds > 0:
+                # Only discharge if we have headroom above the departure target
+                if soc_sim > 0.85:
+                    schedule[i, h] = -max_ds
+                    soc_sim = max(soc_sim - max_ds / 0.92 / cap, 0.10)
             elif h in cheap_hours:
                 if soc_sim < 0.95:
                     schedule[i, h] = max_ch
-                    energy_in = max_ch * 0.92
-                    soc_sim = min(soc_sim + energy_in / cap, 0.95)
+                    soc_sim = min(soc_sim + max_ch * 0.92 / cap, 0.95)
 
-        # Safety pass: ensure we reach required SoC by departure.
-        # If projected SoC at end of planned schedule is below target,
-        # override remaining cheap hours with full charging.
-        soc_check = soc
-        for h in plugged_hours:
+        # Safety pass: if projected SoC at departure is below target, charge greedily
+        soc_proj = soc
+        for h in plugged:
             kw = schedule[i, h]
             if kw > 0:
-                soc_check = min(soc_check + kw * 0.92 / cap, 0.95)
+                soc_proj = min(soc_proj + kw * 0.92 / cap, 0.95)
             elif kw < 0:
-                soc_check = max(soc_check - (-kw) / 0.92 / cap, 0.10)
+                soc_proj = max(soc_proj - (-kw) / 0.92 / cap, 0.10)
 
-        if soc_check < soc_tgt:
-            for h in plugged_hours:
-                if soc_check >= soc_tgt:
+        if soc_proj < 0.80:
+            for h in plugged:
+                if soc_proj >= 0.80:
                     break
                 if schedule[i, h] <= 0:
                     schedule[i, h] = max_ch
-                    soc_check = min(soc_check + max_ch * 0.92 / cap, 0.95)
+                    soc_proj = min(soc_proj + max_ch * 0.92 / cap, 0.95)
 
     return schedule
